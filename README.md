@@ -19,6 +19,7 @@ both ends, and falls back to the CPU on machines where it cannot.
   exists only for your session and follows the size of your window.
 - Your keyboard layout, not the remote's: keys map the same on both ends.
 - A shared clipboard in both directions: text, images, and copied files.
+- The remote machine's sound, played locally.
 - Quality that adapts to the link, giving up frame rate before sharpness.
 - Reconnection when the link drops.
 - A window that follows your Omarchy theme.
@@ -102,6 +103,12 @@ Clipboard sharing trusts every connected host: a host can request the
 advertised clipboard contents without a local paste. Use `gliff --no-clipboard`
 to disable sharing in both directions when connecting to an untrusted host.
 Local selections marked `x-kde-passwordManagerHint` are not shared.
+
+**Audio.** The remote machine's sound plays through your speakers. It is on
+when both ends have PipeWire, needs no setup, and follows the connection:
+switching tabs keeps every machine's audio running. `gliff --no-audio`
+turns it off on your end; to stop the server from sending it, run
+`gliff --server-bin 'gliff-server --no-audio' user@host`.
 
 **Slow links.** gliff measures the link and lowers the frame rate, then the
 colour detail, then the resolution, and raises them again when there is

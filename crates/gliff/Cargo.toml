@@ -18,6 +18,7 @@ tokio = { workspace = true }
 gtk4.workspace = true
 libadwaita.workspace = true
 gliff-proto.workspace = true
+gliff-audio.workspace = true
 gliff-transport.workspace = true
 gliff-vk.workspace = true
 gliff-sw.workspace = true

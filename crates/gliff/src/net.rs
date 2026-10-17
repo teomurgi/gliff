@@ -125,6 +125,8 @@ pub enum Frame {
 pub struct Worker {
     pub endpoint: Endpoint,
     pub video: VideoMode,
+    /// Ask for the server's audio and play it, unless `--no-audio`.
+    pub audio: bool,
     /// Bounded so a stalled UI thread cannot make the decoder buffer frames
     /// without limit; when full, the newest frame is dropped (latest-wins).
     pub frames: SyncSender<Picture>,
@@ -158,6 +160,7 @@ impl Worker {
                         rd,
                         wr,
                         self.video,
+                        self.audio,
                         self.frames,
                         self.status,
                         self.input,
@@ -171,6 +174,7 @@ impl Worker {
                         ssh.stdout,
                         ssh.stdin,
                         self.video,
+                        self.audio,
                         self.frames,
                         self.status,
                         self.input,
@@ -257,10 +261,15 @@ fn tier_label(pipeline: Option<VideoPipeline>, decoder: &VideoDecoder) -> String
     format!("{server}→{}", decoder.label())
 }
 
+// Eight parameters: the channel ends and the per-session choices. Bundling
+// them into a struct would only rename the same list, so the lint is
+// allowed here.
+#[allow(clippy::too_many_arguments)]
 async fn session<R, W>(
     rd: R,
     wr: W,
     video: VideoMode,
+    audio: bool,
     frames: SyncSender<Picture>,
     status: StdSender<Status>,
     mut input: UnboundedReceiver<ToWorker>,
@@ -274,6 +283,16 @@ where
     let mut writer = Framed::new(wr);
 
     let gpu = open_gpu(video);
+    // The audio feature is offered only when the user asked for sound;
+    // the server sends audio only to a client that listed it.
+    let features = if audio {
+        features()
+    } else {
+        features()
+            .into_iter()
+            .filter(|f| f != gliff_proto::FEATURE_AUDIO)
+            .collect()
+    };
     let caps = ClientCaps {
         codecs: vec![Codec::H264],
         max_width: MAX_STREAM.0,
@@ -285,7 +304,7 @@ where
         } else {
             vec![ChromaMode::Single420]
         },
-        features: features(),
+        features,
     };
     let _ = tokio::time::timeout(FIRST_KEYMAP_WAIT, keymap.wait_for(|k| !k.is_empty())).await;
     let first_keymap = keymap.borrow_and_update().clone();
@@ -306,6 +325,7 @@ where
     // estimate is seeded ahead of the first frame ack.
     let mut got_ack = false;
     let mut headless = false;
+    let mut server_features: Vec<String> = Vec::new();
     let (mut width, mut height, mut chroma, mut scale_milli, pipeline, mut view, mut fps_cap) = loop {
         match reader.read_msg::<ServerMsg>().await? {
             ServerMsg::HelloAck {
@@ -320,6 +340,7 @@ where
                     );
                 }
                 tracing::debug!(?features, "server features");
+                server_features = features;
                 headless = session.headless;
                 got_ack = true;
             }
@@ -356,6 +377,29 @@ where
     };
     let mut decoder = new_decoder(&gpu, chroma, width, height)?;
     let mut video_label = tier_label(pipeline, &decoder);
+    // Play the remote machine's sound when both ends agreed on it. The
+    // sink is opened off this loop, so a slow or absent local PipeWire
+    // never delays the first decoded frame; any audio that arrives before
+    // it is up is read and dropped (the framing requires consuming the
+    // payload whatever came of it). The handle lives in the session
+    // scope, so playback runs until the connection ends.
+    let mut playback: Option<gliff_audio::Playback> = None;
+    let (play_tx, mut play_rx) = unbounded_channel::<gliff_audio::Playback>();
+    if audio
+        && server_features
+            .iter()
+            .any(|f| f == gliff_proto::FEATURE_AUDIO)
+    {
+        tokio::task::spawn_blocking(move || match gliff_audio::Playback::start() {
+            Ok(p) => {
+                tracing::info!("audio playing");
+                let _ = play_tx.send(p);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "audio unavailable; continuing video-only");
+            }
+        });
+    }
     let _ = status.send(Status::Connected {
         video: video_label.clone(),
         view_width: view.0,
@@ -516,6 +560,13 @@ where
                         Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
                     }
                 }
+                continue;
+            }
+            // The playback thread finished opening the local sink; audio
+            // that arrives from here on is decoded into it. A `Some`
+            // pattern, so the closed channel disarms the arm afterwards.
+            Some(p) = play_rx.recv() => {
+                playback = Some(p);
                 continue;
             }
             written = &mut writes => {
@@ -713,6 +764,19 @@ where
                 let _ = out_tx.send((ClientMsg::Pong { t }, Bytes::new()));
             }
             ServerMsg::CursorPos { .. } | ServerMsg::Pong { .. } => {}
+            ServerMsg::Audio {
+                packets, data_len, ..
+            } => {
+                // The payload must be drained whether or not playback is
+                // running (it should not arrive at all without the feature,
+                // but the framing requires consuming it).
+                let data = reader.read_payload(data_len).await?;
+                if let Some(playback) = &playback {
+                    for packet in gliff_audio::framing::unpack(&data, packets)? {
+                        playback.play(packet);
+                    }
+                }
+            }
             ServerMsg::Error { code, message, .. } if is_incompatible(code) => {
                 return Err(Incompatible(message).into())
             }

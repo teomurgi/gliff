@@ -18,7 +18,17 @@ use tokio::task::JoinHandle;
 #[derive(Default)]
 struct Queue {
     packets: VecDeque<(ServerMsg, Vec<Vec<u8>>)>,
+    /// Audio messages dropped for a full queue, so the first drop warns
+    /// once and the rest stay quiet.
+    audio_dropped: u64,
 }
+
+/// Audio messages kept waiting for a stalled write: one second of sound.
+/// A socket stalled longer than that is worth more as dropped audio —
+/// near-live after the stall, the gap concealed by Opus — than as a
+/// second of sound arriving late; the capture-side queue bounds the same
+/// race the same way.
+const MAX_QUEUED_AUDIO: usize = 40;
 
 impl Queue {
     /// True when no video frame is queued. The session encodes at most one
@@ -65,6 +75,33 @@ impl Queue {
             | ServerMsg::ClipboardData { .. }
             | ServerMsg::ClipboardAck { .. }
             | ServerMsg::ClipboardAbort { .. } => {}
+            // Constant small rate (~50 messages a second, each at most a
+            // few packets); bounded by the capture drain, never coalesced
+            // because a dropped packet is an audible gap — except past
+            // MAX_QUEUED_AUDIO, where lateness beats completeness.
+            ServerMsg::Audio { .. } => {
+                let queued_audio = self
+                    .packets
+                    .iter()
+                    .filter(|(msg, _)| matches!(msg, ServerMsg::Audio { .. }))
+                    .count();
+                if queued_audio >= MAX_QUEUED_AUDIO {
+                    if let Some(i) = self
+                        .packets
+                        .iter()
+                        .position(|(msg, _)| matches!(msg, ServerMsg::Audio { .. }))
+                    {
+                        self.packets.remove(i);
+                    }
+                    self.audio_dropped += 1;
+                    if self.audio_dropped == 1 {
+                        tracing::warn!(
+                            queued = MAX_QUEUED_AUDIO,
+                            "audio is queued behind a stalled write; dropping the oldest"
+                        );
+                    }
+                }
+            }
             _ => unreachable!("unsupported queued server message"),
         }
         self.packets.push_back((msg, payloads));
@@ -254,6 +291,46 @@ mod tests {
             queue.packets[0].0,
             ServerMsg::ClipboardData { id: 0, .. }
         ));
+    }
+
+    fn audio(pts: u64) -> (ServerMsg, Vec<Vec<u8>>) {
+        (
+            ServerMsg::Audio {
+                pts_us: pts,
+                packets: 1,
+                data_len: 4,
+            },
+            vec![vec![0; 4]],
+        )
+    }
+
+    #[test]
+    fn a_stalled_write_drops_the_oldest_audio_beyond_one_second() {
+        let mut queue = Queue::default();
+        // A clipboard message ahead of the audio keeps its place while the
+        // oldest audio goes.
+        queue.push(ServerMsg::ClipboardAck { id: 1, received: 1 }, Vec::new());
+        for i in 0..MAX_QUEUED_AUDIO + 20 {
+            let (msg, payloads) = audio(i as u64);
+            queue.push(msg, payloads);
+        }
+        assert_eq!(queue.packets.len(), 1 + MAX_QUEUED_AUDIO);
+        assert!(matches!(queue.packets[0].0, ServerMsg::ClipboardAck { .. }));
+        let pts: Vec<u64> = queue
+            .packets
+            .iter()
+            .skip(1)
+            .map(|(m, _)| match m {
+                ServerMsg::Audio { pts_us, .. } => *pts_us,
+                _ => unreachable!(),
+            })
+            .collect();
+        // The newest MAX_QUEUED_AUDIO messages, in order.
+        assert_eq!(
+            pts,
+            (20..MAX_QUEUED_AUDIO as u64 + 20).collect::<Vec<u64>>()
+        );
+        assert_eq!(queue.audio_dropped, 20);
     }
 
     #[tokio::test]

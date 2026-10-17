@@ -20,6 +20,8 @@ depends=(
   'libxkbcommon'
   'mesa'
   'openssh'
+  'opus'
+  'pipewire'
   'vulkan-icd-loader'
   'wayland'
 )

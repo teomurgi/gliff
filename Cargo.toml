@@ -10,6 +10,7 @@ members = [
     "crates/gliff-va",
     "crates/gliff-vk",
     "crates/gliff-sw",
+    "crates/gliff-audio",
     "crates/gliff",
     "crates/gliff-server",
     "crates/gliff-probe",
@@ -29,6 +30,7 @@ undocumented_unsafe_blocks = "warn"
 
 [workspace.dependencies]
 gliff-proto = { path = "crates/gliff-proto" }
+gliff-audio = { path = "crates/gliff-audio" }
 gliff-transport = { path = "crates/gliff-transport" }
 hypr-ipc = { path = "crates/hypr-ipc" }
 hypr-wl = { path = "crates/hypr-wl" }
@@ -39,6 +41,10 @@ gliff-vk = { path = "crates/gliff-vk" }
 gliff-sw = { path = "crates/gliff-sw" }
 openh264 = { version = "0.9", features = ["source"] }
 openh264-sys2 = "0.9"
+
+pipewire = { version = "0.10", features = ["v0_3_49"] }
+libspa = "0.10"
+opus = "0.4"
 
 anyhow = "1"
 thiserror = "2"

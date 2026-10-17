@@ -34,7 +34,9 @@ pub const PROTOCOL_VERSION: u16 = 1;
 
 /// Optional behaviours this build supports, exchanged in the handshake. A
 /// behaviour is used only when both ends list it.
-pub const FEATURES: &[&str] = &[];
+pub const FEATURE_AUDIO: &str = "audio";
+
+pub const FEATURES: &[&str] = &[FEATURE_AUDIO];
 
 pub fn features() -> Vec<String> {
     FEATURES.iter().map(|f| f.to_string()).collect()
@@ -458,6 +460,20 @@ pub enum ServerMsg {
         #[n(0)]
         t: u64,
     },
+    /// One or more Opus packets (each a 20 ms frame), as `len`-prefixed
+    /// payloads following the header: `packets` chunks of
+    /// `u16 LE length || bytes`, `data_len` bytes in total. Sent only to a
+    /// client that listed `FEATURE_AUDIO`. `pts_us` is the capture time of
+    /// the first packet.
+    #[n(13)]
+    Audio {
+        #[n(0)]
+        pts_us: u64,
+        #[n(1)]
+        packets: u8,
+        #[n(2)]
+        data_len: u32,
+    },
 }
 
 impl ServerMsg {
@@ -630,6 +646,13 @@ mod tests {
         };
         let bytes = minicbor::to_vec(&s).unwrap();
         assert_eq!(minicbor::decode::<ServerMsg>(&bytes).unwrap(), s);
+        let s = ServerMsg::Audio {
+            pts_us: 1_000_000,
+            packets: 2,
+            data_len: 300,
+        };
+        let bytes = minicbor::to_vec(&s).unwrap();
+        assert_eq!(minicbor::decode::<ServerMsg>(&bytes).unwrap(), s);
     }
 
     #[test]
@@ -771,6 +794,14 @@ mod tests {
                 "8202860102f5818400000a0a18641832",
             ),
             (ServerMsg::error(ERROR_VERSION, "m"), "82098301616d01"),
+            (
+                ServerMsg::Audio {
+                    pts_us: 1_000_000,
+                    packets: 2,
+                    data_len: 300,
+                },
+                "820d831a000f42400219012c",
+            ),
         ];
         for (msg, bytes) in server {
             assert_eq!(hex(&minicbor::to_vec(&msg).unwrap()), bytes, "{msg:?}");

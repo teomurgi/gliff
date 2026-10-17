@@ -41,6 +41,8 @@ pub struct Config {
     pub video: VideoMode,
     /// Dual-stream 4:4:4 on the CPU tier too (it defaults to Single420).
     pub full_chroma: bool,
+    /// Do not forward the session's audio to the client.
+    pub no_audio: bool,
     /// What the capture ring is made of; `Shm` implies the CPU tier.
     pub capture: CaptureMode,
 }
@@ -186,6 +188,19 @@ where
             .ok();
     }
 
+    // Audio capture starts off the session loop — a machine whose PipeWire
+    // answers slowly (or never) must not delay the first video frame by the
+    // length of the connect timeout — and is only SENT inside the loop, so
+    // the client never sees an Audio message ahead of StreamConfig.
+    let (audio_tx, mut audio_rx) =
+        mpsc::unbounded_channel::<Result<gliff_audio::Capture, gliff_audio::Error>>();
+    if wants_audio(cfg.no_audio, &caps) {
+        tokio::task::spawn_blocking(move || {
+            let _ = audio_tx.send(gliff_audio::Capture::start());
+        });
+    }
+    let mut audio: Option<gliff_audio::Capture> = None;
+
     let (clip_ev_tx, mut clip_ev_rx) = mpsc::unbounded_channel::<ClipboardEvent>();
     let compositor_clipboard = Clipboard::start(
         cfg.target.clone(),
@@ -209,6 +224,12 @@ where
 
     let mut msg_rx = spawn_reader(reader);
     let (writer, mut write_reports) = Writer::spawn(writer);
+
+    // How often queued Opus frames are gathered into an Audio message.
+    // 25 ms keeps batches to one or two 20 ms packets without adding
+    // noticeable latency.
+    let audio_every = Duration::from_millis(25);
+    let mut audio_next = tokio::time::Instant::now() + audio_every;
 
     capturer.request_frame().ok();
     let first_frame_deadline =
@@ -281,6 +302,31 @@ where
                 ControlFlow::Continue(())
             }
             ev = cap_rx.recv() => session.on_capture(ev)?,
+            // The capture thread finished setting up (or failed): store the
+            // handle, or log why the session runs without sound. A `Some`
+            // pattern, so the closed channel disarms the arm afterwards
+            // instead of waking the loop forever.
+            Some(started) = audio_rx.recv() => {
+                match started {
+                    Ok(capture) => {
+                        tracing::info!("audio streaming");
+                        audio = Some(capture);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "audio unavailable; continuing video-only");
+                    }
+                }
+                ControlFlow::Continue(())
+            },
+            // The audio tick: drain the capture and queue one Audio
+            // message with what accumulated (usually 1-2 Opus packets).
+            _ = tokio::time::sleep_until(audio_next), if audio.is_some() => {
+                audio_next = tokio::time::Instant::now() + audio_every;
+                if let Some(capture) = &mut audio {
+                    send_audio(capture, &session.writer);
+                }
+                ControlFlow::Continue(())
+            }
             report = write_reports.recv() => {
                 let elapsed = report.context("writer task ended")??;
                 // A write that took longer than a frame interval means the
@@ -324,6 +370,9 @@ where
     }
 
     session.inject(InputCmd::ReleaseAll);
+    // The capture thread's queue empties into the session; dropping it
+    // stops its PipeWire loop before the session's own teardown.
+    drop(audio);
     let Session {
         capturer,
         input,
@@ -337,6 +386,41 @@ where
     drop(input);
     drop(output);
     Ok(())
+}
+
+/// Whether this session should ask for audio: not disabled here, and the
+/// client listed the feature. The capture itself starts off the session
+/// loop, so slow or absent audio never delays video.
+fn wants_audio(no_audio: bool, caps: &ClientCaps) -> bool {
+    !no_audio
+        && caps
+            .features
+            .iter()
+            .any(|f| f == gliff_proto::FEATURE_AUDIO)
+}
+
+/// Queue one Audio message with whatever Opus packets accumulated since
+/// the last tick. Audio does not feed the `LinkEstimator`: it is a
+/// constant ~128 kbit/s that is never acked, so counting it would grow the
+/// inflight bytes without bound and starve the video byte cap. A future
+/// improvement can feed it in with a "never acked, aged out after one RTT
+/// window" treatment; for now the rate controller simply does not see it.
+fn send_audio(capture: &mut gliff_audio::Capture, writer: &Writer) {
+    let mut packets = Vec::new();
+    capture.drain(&mut packets);
+    if packets.is_empty() {
+        return;
+    }
+    let mut data = Vec::new();
+    gliff_audio::framing::pack(&packets, &mut data);
+    writer.send(
+        ServerMsg::Audio {
+            pts_us: now_ms() * 1000,
+            packets: packets.len() as u8,
+            data_len: data.len() as u32,
+        },
+        vec![data],
+    );
 }
 
 /// Read the client's Hello and check its protocol version.

@@ -41,7 +41,7 @@ CPU tier prefers one 4:2:0 stream, since the second stream doubles the
 encode work; `--full-chroma` on a CPU server keeps Dual420 for a GPU client.
 
 Keyboard, pointer, resize, frame acks and keyframe requests flow client→server;
-video, cursor and pongs flow server→client.
+video, cursor, audio and pongs flow server→client.
 
 ## Crates
 
@@ -56,6 +56,7 @@ video, cursor and pongs flow server→client.
 | `gliff-va` | libva display, H.264 encode/decode contexts on driver-owned surfaces, dmabuf export, the H.264 header parser and writer | yes, libva calls through committed bindgen output |
 | `gliff-vk` | Vulkan device, dmabuf import/export, split/recombine compute, the pipeline that hands surfaces to `gliff-va` | yes, Vulkan API calls |
 | `gliff-sw` | CPU fallback with OpenH264 encode/decode, fused BGRA<->I420 conversion | the encoder trace level through the raw API, and the AVX2 row kernels (pointer loads and stores) |
+| `gliff-audio` | PipeWire capture of the default sink's monitor and playback into the local sink, Opus encode/decode | closing the loop's poll fd to stop the audio thread |
 | `gliff-server` | ties capture+input+encoder to the protocol; `--stdio`/`--listen` | none |
 | `gliff` | GTK4/libadwaita UI, decode worker | one block: hands GTK a dmabuf fd |
 | `gliff-probe` | environment checks and the headless test client | none |
@@ -189,6 +190,33 @@ Every crate with `unsafe` documents the safety requirements at each block.
   re-encoded (at most 8 times, 200 ms apart, stopping once a pass codes
   below a fifth of the frame budget), so a picture that arrived soft under
   a low starting budget converges to sharp.
+
+- **Audio.** The server captures the default sink's monitor over PipeWire
+  (48 kHz stereo F32LE), encodes it as Opus at 128 kbit/s in 20 ms frames,
+  and sends it as `Audio` messages when both ends listed the `audio`
+  feature in the handshake; the client decodes the packets and plays them
+  into the local default sink. Each side is one thread with a PipeWire main
+  loop, owned by a handle whose drop stops it, so a machine without
+  PipeWire, an audio device or the opus library runs video-only with one
+  warning — and the source and sink are opened off the session loops, so
+  a machine whose audio answers slowly never delays its first video frame.
+  Both ends advertise exactly the one format, so the graph adapts and no
+  resampling is needed; a mismatch stops the stream. Queues are bounded
+  and drop the oldest (one second on capture, 1.2 s on playback — the sink
+  runs the stream's callback about four times a second and takes two ~256 ms
+  buffers each time, so the queue must cover one callback's whole take —
+  and one second in the server's writer behind a stalled write), Opus
+  concealing the gap, and the sink is fed silence when packets run out.
+  Playback also follows the sender's clock: a playout depth kept near the
+  queue's midpoint plays up to 2% fast or slow (about 35 cents, too small
+  to hear), so clock drift becomes latency that never grows instead of
+  drops. There is no
+  clock sync to the video: the two streams are independent. Audio does not
+  feed the rate estimator — it is a constant ~128 kbit/s that is never
+  acked, so counting it would grow the inflight bytes without bound and
+  starve the video byte cap; treating it as estimator input with a "never
+  acked, aged out after one RTT window" rule is future work. `--no-audio`
+  on either binary disables it.
 
 - **Threading.** Each pipeline lives on one thread: the server loop and the
   client decode worker are current-thread tokio runtimes that own their
@@ -361,7 +389,8 @@ items surfaced by code review.
 The binaries are dynamically linked: `gliff-server`/`gliff-probe` need
 libvulkan, libva, libva-drm, libgbm, libdrm, libwayland-client, libxkbcommon
 and libc; the Vulkan loader `dlopen`s the GPU's ICD and libva the GPU's VA
-driver; `gliff` additionally pulls the full GTK4 runtime. A normal Hyprland
+driver; `gliff` additionally pulls the full GTK4 runtime, and both `gliff`
+and `gliff-server` link libpipewire and libopus for audio. A normal Hyprland
 desktop already has all of these (they are the `pkgbuild/PKGBUILD` `depends`). The Rust
 side is `ash` (thin generated bindings, no C build step) and committed
 bindgen output for libva (`crates/gliff-va/bindings/gen.sh` regenerates it)

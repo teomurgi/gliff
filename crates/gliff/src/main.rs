@@ -54,6 +54,9 @@ struct Cli {
     /// Disable clipboard sharing in both directions for every tab.
     #[arg(long)]
     no_clipboard: bool,
+    /// Do not play the remote machine's audio.
+    #[arg(long)]
+    no_audio: bool,
     /// Dev: connect directly to a `gliff-server --listen` address. Repeat it
     /// to open a tab for each.
     #[arg(long)]
@@ -991,6 +994,7 @@ fn start_session(ui: Rc<App>, s: Rc<Session>) {
 
     let endpoint = s.endpoint.clone();
     let video = gliff_sw::VideoMode::resolve(ui.cli.video.as_deref());
+    let audio = !ui.cli.no_audio;
     let keymap = ui.keymap.clone();
     std::thread::Builder::new()
         .name("gliff-net".into())
@@ -998,6 +1002,7 @@ fn start_session(ui: Rc<App>, s: Rc<Session>) {
             Worker {
                 endpoint,
                 video,
+                audio,
                 frames: frame_tx,
                 status: status_tx,
                 input: input_rx,
