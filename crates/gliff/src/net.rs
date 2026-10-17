@@ -127,6 +127,9 @@ pub struct Worker {
     pub video: VideoMode,
     /// Ask for the server's audio and play it, unless `--no-audio`.
     pub audio: bool,
+    /// The session's audio toggle when the worker starts (it may have been
+    /// turned off in the UI before a reconnect).
+    pub audio_on: bool,
     /// Bounded so a stalled UI thread cannot make the decoder buffer frames
     /// without limit; when full, the newest frame is dropped (latest-wins).
     pub frames: SyncSender<Picture>,
@@ -161,6 +164,7 @@ impl Worker {
                         wr,
                         self.video,
                         self.audio,
+                        self.audio_on,
                         self.frames,
                         self.status,
                         self.input,
@@ -175,6 +179,7 @@ impl Worker {
                         ssh.stdin,
                         self.video,
                         self.audio,
+                        self.audio_on,
                         self.frames,
                         self.status,
                         self.input,
@@ -261,7 +266,7 @@ fn tier_label(pipeline: Option<VideoPipeline>, decoder: &VideoDecoder) -> String
     format!("{server}→{}", decoder.label())
 }
 
-// Eight parameters: the channel ends and the per-session choices. Bundling
+// Nine parameters: the channel ends and the per-session choices. Bundling
 // them into a struct would only rename the same list, so the lint is
 // allowed here.
 #[allow(clippy::too_many_arguments)]
@@ -270,6 +275,7 @@ async fn session<R, W>(
     wr: W,
     video: VideoMode,
     audio: bool,
+    audio_on: bool,
     frames: SyncSender<Picture>,
     status: StdSender<Status>,
     mut input: UnboundedReceiver<ToWorker>,
@@ -377,28 +383,23 @@ where
     };
     let mut decoder = new_decoder(&gpu, chroma, width, height)?;
     let mut video_label = tier_label(pipeline, &decoder);
-    // Play the remote machine's sound when both ends agreed on it. The
+    // Audio the user wants, and the server agrees to carry. Playback is
+    // started and stopped from the session loop as the user toggles it; the
     // sink is opened off this loop, so a slow or absent local PipeWire
-    // never delays the first decoded frame; any audio that arrives before
-    // it is up is read and dropped (the framing requires consuming the
-    // payload whatever came of it). The handle lives in the session
-    // scope, so playback runs until the connection ends.
+    // never delays the first decoded frame. Any audio that arrives while no
+    // playback runs is read and dropped (the framing requires consuming the
+    // payload whatever came of it).
+    let server_audio = server_features
+        .iter()
+        .any(|f| f == gliff_proto::FEATURE_AUDIO);
+    let mut audio_on = audio && server_audio && audio_on;
     let mut playback: Option<gliff_audio::Playback> = None;
     let (play_tx, mut play_rx) = unbounded_channel::<gliff_audio::Playback>();
-    if audio
-        && server_features
-            .iter()
-            .any(|f| f == gliff_proto::FEATURE_AUDIO)
-    {
-        tokio::task::spawn_blocking(move || match gliff_audio::Playback::start() {
-            Ok(p) => {
-                tracing::info!("audio playing");
-                let _ = play_tx.send(p);
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "audio unavailable; continuing video-only");
-            }
-        });
+    // The UI's toggle reaches this loop (which owns playback) through a
+    // channel; it both tells the server and starts or stops local playback.
+    let (audio_cmd_tx, mut audio_cmd_rx) = unbounded_channel::<bool>();
+    if audio_on {
+        start_playback(play_tx.clone());
     }
     let _ = status.send(Status::Connected {
         video: video_label.clone(),
@@ -418,6 +419,12 @@ where
     // never block on a write and the two peers cannot deadlock. Both the reader
     // loop (acks, keyframe requests) and the UI thread (input) feed `out_tx`.
     let (out_tx, mut out_rx) = unbounded_channel::<(ClientMsg, Bytes)>();
+    // A session whose toggle was off before the connect tells the server
+    // now: its default is to stream, and the toggles after this only travel
+    // when the state changes.
+    if audio && server_audio && !audio_on {
+        let _ = out_tx.send((ClientMsg::AudioEnable { enabled: false }, Bytes::new()));
+    }
     let mut writes = tokio::task::spawn_local(async move {
         while let Some((m, payload)) = out_rx.recv().await {
             if payload.is_empty() {
@@ -455,6 +462,7 @@ where
     {
         let out_tx = out_tx.clone();
         let clipboard = clipboard.clone();
+        let audio_cmd_tx = audio_cmd_tx.clone();
         tokio::task::spawn_local(async move {
             let mut follow_keymap = true;
             loop {
@@ -473,6 +481,10 @@ where
                         Some(ToWorker::Send(m)) => m,
                         Some(ToWorker::Zoom(z)) => {
                             let _ = zoom_tx.send(z.max(1));
+                            continue;
+                        }
+                        Some(ToWorker::Audio(on)) => {
+                            let _ = audio_cmd_tx.send(on);
                             continue;
                         }
                         Some(other) => {
@@ -567,6 +579,24 @@ where
             // pattern, so the closed channel disarms the arm afterwards.
             Some(p) = play_rx.recv() => {
                 playback = Some(p);
+                continue;
+            }
+            // The user's audio toggle: tell the server (which stops or
+            // restarts its capture), and stop or start local playback.
+            // Stopping drops the handle, whose Drop joins the thread. An
+            // `AudioEnable` goes only to a server that listed the feature.
+            Some(on) = audio_cmd_rx.recv() => {
+                if on != audio_on {
+                    audio_on = on;
+                    if on {
+                        start_playback(play_tx.clone());
+                    } else {
+                        playback = None;
+                    }
+                    if server_audio {
+                        let _ = out_tx.send((ClientMsg::AudioEnable { enabled: on }, Bytes::new()));
+                    }
+                }
                 continue;
             }
             written = &mut writes => {
@@ -768,8 +798,8 @@ where
                 packets, data_len, ..
             } => {
                 // The payload must be drained whether or not playback is
-                // running (it should not arrive at all without the feature,
-                // but the framing requires consuming it).
+                // running: the framing requires consuming it, and packets
+                // that arrive after the user's off toggle are dropped here.
                 let data = reader.read_payload(data_len).await?;
                 if let Some(playback) = &playback {
                     for packet in gliff_audio::framing::unpack(&data, packets)? {
@@ -828,6 +858,19 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Open the local sink off the session loop and hand the handle to it.
+fn start_playback(play_tx: tokio::sync::mpsc::UnboundedSender<gliff_audio::Playback>) {
+    tokio::task::spawn_blocking(move || match gliff_audio::Playback::start() {
+        Ok(p) => {
+            tracing::info!("audio playing");
+            let _ = play_tx.send(p);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "audio unavailable; continuing video-only");
+        }
+    });
 }
 
 fn validate_stream_size(width: u32, height: u32) -> anyhow::Result<()> {

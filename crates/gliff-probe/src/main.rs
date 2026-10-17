@@ -621,6 +621,18 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize, video: VideoMod
         let mut got = 0usize;
         let mut keyframes = 0usize;
         let mut scaled = false;
+        // GLIFF_TEST_AUDIO_TOGGLE exercises the runtime audio switch: once
+        // audio flows, turn it off and check nothing arrives after the
+        // in-flight batches, then turn it on and check it resumes. Driven by
+        // the messages themselves, so it needs no clock of its own.
+        let audio_toggle = std::env::var_os("GLIFF_TEST_AUDIO_TOGGLE").is_some();
+        // 0 waiting for audio, 1 off sent, 2 on sent, 3 done or not testing.
+        let mut audio_stage = if audio_toggle { 0 } else { 3 };
+        let mut audio_batches = 0usize;
+        let mut audio_off_sent = None::<std::time::Instant>;
+        let mut audio_late = 0usize;
+        let mut audio_on_sent = None::<std::time::Instant>;
+        let mut audio_resumed = 0usize;
         // GLIFF_SEND_CLIP offers text; GLIFF_SEND_CLIP_FILE offers a file as
         // application/octet-stream; GLIFF_SEND_CLIP_FILES (colon-separated
         // paths) offers copied files. GLIFF_RECV_CLIP_FILE stores a received
@@ -783,8 +795,59 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize, video: VideoMod
                     if let Some(s) = serving.as_mut() { s.3 = s.3.saturating_sub(1); }
                     push_chunks(&mut writer, &mut serving).await?;
                 }
-                ServerMsg::CursorPos { .. } | ServerMsg::Pong { .. } | ServerMsg::Error { .. } => {}
+                ServerMsg::Audio {
+                    packets, data_len, ..
+                } => {
+                    // The payload must be drained whether or not it is
+                    // played: the framing requires consuming it.
+                    let _ = reader.read_payload(data_len).await?;
+                    if audio_stage == 0 {
+                        audio_batches += 1;
+                        // Audio is batched every 25 ms; two batches in means
+                        // the stream is flowing before anything is toggled.
+                        if audio_batches >= 2 {
+                            eprintln!("  audio flowing (batches seen: {audio_batches}), toggling off");
+                            writer.write_msg(&ClientMsg::AudioEnable { enabled: false }).await?;
+                            audio_off_sent = Some(std::time::Instant::now());
+                            audio_stage = 1;
+                        }
+                    } else if audio_stage == 1 {
+                        // Batches already queued by the server's writer when
+                        // the off arrived may still land; they must stop
+                        // within a generous window around the off.
+                        if audio_off_sent.is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(2)) {
+                            audio_late += 1;
+                        }
+                    } else if audio_stage == 2 {
+                        // Once the off settled, re-enable and count what
+                        // resumes.
+                        if audio_on_sent.is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(3)) {
+                            if audio_resumed == 0 {
+                                eprintln!("  audio resumed, {} packets in the first batch", packets);
+                            }
+                            audio_resumed += 1;
+                        }
+                    }
+                }
                 _ => {}
+            }
+            // Advance the audio toggle state machine once the off has fully
+            // settled (nothing landed after the grace window) and again once
+            // audio is proven to have resumed.
+            if audio_stage == 1
+                && audio_late == 0
+                && audio_off_sent
+                    .is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(3))
+            {
+                eprintln!("  audio stopped; toggling on");
+                writer
+                    .write_msg(&ClientMsg::AudioEnable { enabled: true })
+                    .await?;
+                audio_on_sent = Some(std::time::Instant::now());
+                audio_stage = 2;
+            } else if audio_stage == 2 && audio_resumed >= 3 {
+                eprintln!("  audio resumed after re-enable");
+                audio_stage = 3;
             }
         }
         writer.write_msg(&ClientMsg::Bye).await?;
@@ -793,6 +856,15 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize, video: VideoMod
         if frames > 3 {
             let what = if session.headless { "server applied the requested output scale" } else { "server scaled the mirrored screen down to the window" };
             status(scaled, what);
+        }
+        if audio_toggle {
+            status(
+                audio_stage == 3,
+                &format!(
+                    "audio toggle: batches {} late {} resumed {}",
+                    audio_batches, audio_late, audio_resumed
+                ),
+            );
         }
         Ok::<(), anyhow::Error>(())
     })?;

@@ -211,8 +211,13 @@ Every crate with `unsafe` documents the safety requirements at each block.
   queue's midpoint plays up to 2% fast or slow (about 35 cents, too small
   to hear), so clock drift becomes latency that never grows instead of
   drops. There is no
-  clock sync to the video: the two streams are independent. Audio does not
-  feed the rate estimator — it is a constant ~128 kbit/s that is never
+  clock sync to the video: the two streams are independent. The title-bar
+  speaker toggle turns a session's audio on and off mid-stream: an
+  `AudioEnable` from the client drops the server's capture (its handle's
+  drop joins the thread) or starts it again, and the client drops or opens
+  its playback the same way; a session that starts with audio off tells
+  the server right after the handshake, so reconnects keep the choice.
+  Audio does not feed the rate estimator — it is a constant ~128 kbit/s that is never
   acked, so counting it would grow the inflight bytes without bound and
   starve the video byte cap; treating it as estimator input with a "never
   acked, aged out after one RTT window" rule is future work. `--no-audio`

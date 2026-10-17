@@ -191,10 +191,14 @@ where
     // Audio capture starts off the session loop — a machine whose PipeWire
     // answers slowly (or never) must not delay the first video frame by the
     // length of the connect timeout — and is only SENT inside the loop, so
-    // the client never sees an Audio message ahead of StreamConfig.
+    // the client never sees an Audio message ahead of StreamConfig. The
+    // sender half stays alive for the whole session, so the client's
+    // `AudioEnable` can restart the capture later through the same channel.
     let (audio_tx, mut audio_rx) =
         mpsc::unbounded_channel::<Result<gliff_audio::Capture, gliff_audio::Error>>();
-    if wants_audio(cfg.no_audio, &caps) {
+    let mut audio_wanted = wants_audio(cfg.no_audio, &caps);
+    if audio_wanted {
+        let audio_tx = audio_tx.clone();
         tokio::task::spawn_blocking(move || {
             let _ = audio_tx.send(gliff_audio::Capture::start());
         });
@@ -230,6 +234,10 @@ where
     // noticeable latency.
     let audio_every = Duration::from_millis(25);
     let mut audio_next = tokio::time::Instant::now() + audio_every;
+    // The client's audio on/off reaches this loop (which owns the capture)
+    // through a channel, not a return value, so `on_client_msg` stays a
+    // plain fallible handler.
+    let (audio_cmd_tx, mut audio_cmd_rx) = mpsc::unbounded_channel::<bool>();
 
     capturer.request_frame().ok();
     let first_frame_deadline =
@@ -253,6 +261,7 @@ where
         settings,
         encoder,
         input,
+        audio_cmd: audio_cmd_tx,
         capturer,
         pending: None,
         capture_asked: true,
@@ -302,16 +311,33 @@ where
                 ControlFlow::Continue(())
             }
             ev = cap_rx.recv() => session.on_capture(ev)?,
+            // The client turned its audio on or off: off drops the capture
+            // (its Drop stops the thread), on restarts it off the loop.
+            Some(on) = audio_cmd_rx.recv() => {
+                audio_wanted = on;
+                if on && audio.is_none() {
+                    let audio_tx = audio_tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = audio_tx.send(gliff_audio::Capture::start());
+                    });
+                } else if !on {
+                    audio = None;
+                }
+                ControlFlow::Continue(())
+            },
             // The capture thread finished setting up (or failed): store the
             // handle, or log why the session runs without sound. A `Some`
             // pattern, so the closed channel disarms the arm afterwards
             // instead of waking the loop forever.
             Some(started) = audio_rx.recv() => {
                 match started {
-                    Ok(capture) => {
+                    Ok(capture) if audio_wanted => {
                         tracing::info!("audio streaming");
                         audio = Some(capture);
                     }
+                    // The client switched audio off while this capture was
+                    // starting; stop it straight away.
+                    Ok(_) => {}
                     Err(e) => {
                         tracing::warn!(error = %e, "audio unavailable; continuing video-only");
                     }
@@ -523,6 +549,9 @@ struct Session {
     settings: EncoderSettings,
     encoder: VideoEncoder,
     input: Input,
+    /// Where `AudioEnable` from the client goes: the session loop owns the
+    /// capture and acts on it there.
+    audio_cmd: UnboundedSender<bool>,
     capturer: Capturer,
     /// The newest captured frame not yet encoded.
     pending: Option<CapturedFrame>,
@@ -681,6 +710,20 @@ impl Session {
                 let rtt_ms = now_ms().saturating_sub(t) as f64;
                 self.link.seed_rtt(Instant::now(), rtt_ms);
             }
+            // Handled in the session loop, which owns the audio capture.
+            // Only a client that listed the feature may toggle it: a
+            // `--no-audio` client's caps leave audio unnegotiated for the
+            // whole session.
+            ClientMsg::AudioEnable { enabled }
+                if self
+                    .caps
+                    .features
+                    .iter()
+                    .any(|f| f == gliff_proto::FEATURE_AUDIO) =>
+            {
+                let _ = self.audio_cmd.send(enabled);
+            }
+            ClientMsg::AudioEnable { .. } => {}
             // The reader task routes clipboard messages to the Bridge.
             ClientMsg::ClipboardData { .. }
             | ClientMsg::ClipboardOffer { .. }

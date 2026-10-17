@@ -349,4 +349,40 @@ inhibits=$(grep -c "compositor shortcut inhibit" "$ilog")
 rm -rf "$ixdg" "$txdg" "$ilog"
 echo "   shortcut inhibit PASS"
 
+echo "== 13. runtime audio toggle stops and resumes the stream =="
+# The server's headless output has no sound of its own, and even a silent
+# monitor produces Opus batches; a near-inaudible tone on the default sink
+# keeps it from suspending while the client toggles audio off and on.
+if command -v pw-cat >/dev/null; then
+    tone=$(mktemp --suffix=.wav)
+    python3 - "$tone" <<'PY'
+import math, struct, wave, sys
+with wave.open(sys.argv[1], "wb") as w:
+    w.setnchannels(2); w.setsampwidth(2); w.setframerate(48000)
+    w.writeframes(b"".join(
+        struct.pack("<hh", a, a)
+        for a in (int(4000 * math.sin(2 * math.pi * 440 * t / 48000)) for t in range(48000 * 30))
+    ))
+PY
+    RUST_LOG=info "$SERVER" --listen 127.0.0.1:9051 --headless --instance "$NEST_SIG" >/tmp/gliff-e2e-server.log 2>&1 &
+    asp=$!; PIDS+=("$asp"); sleep 2
+    damage & adp=$!; PIDS+=("$adp")
+    pw-cat -p --volume 0.002 "$tone" >/dev/null 2>&1 & atp=$!; PIDS+=("$atp")
+    alog=$(mktemp)
+    GLIFF_TEST_AUDIO_TOGGLE=1 timeout 20 $PROBE --video cpu serve-test --connect 127.0.0.1:9051 --frames 600 >"$alog" 2>&1 || true
+    kill "$atp" "$adp" 2>/dev/null; sleep 1
+    if grep -q "audio unavailable" /tmp/gliff-e2e-server.log; then
+        kill "$asp" 2>/dev/null; rm -f "$tone" "$alog"
+        echo "   skipped (server has no audio to stream)"
+    else
+        grep -q "audio flowing" "$alog" || fail "audio toggle: stream never flowed"
+        grep -q "audio stopped; toggling on" "$alog" || fail "audio toggle: batches kept arriving after the off"
+        grep -q "audio resumed after re-enable" "$alog" || fail "audio toggle: stream did not resume after the on"
+        rm -f "$tone" "$alog"
+        echo "   audio toggle PASS"
+    fi
+else
+    echo "   skipped (needs pw-cat)"
+fi
+
 echo "E2E PASS: all checks passed"

@@ -106,7 +106,10 @@ Local selections marked `x-kde-passwordManagerHint` are not shared.
 
 **Audio.** The remote machine's sound plays through your speakers. It is on
 when both ends have PipeWire, needs no setup, and follows the connection:
-switching tabs keeps every machine's audio running. `gliff --no-audio`
+switching tabs keeps every machine's audio running. The speaker icon before
+the stats button in the title bar turns a session's audio on and off: off
+stops the remote capture and the local playback together, on restarts both.
+`gliff --no-audio`
 turns it off on your end; to stop the server from sending it, run
 `gliff --server-bin 'gliff-server --no-audio' user@host`.
 

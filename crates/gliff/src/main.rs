@@ -107,6 +107,11 @@ struct App {
     tabs: gtk::Box,
     /// Expands into the address bar; hidden while the address bar shows.
     add_btn: gtk::Button,
+    /// Toggles the active session's remote audio: the server's capture and
+    /// the local playback together. `syncing` marks the programmatic
+    /// `set_active` calls that must not send to the worker.
+    audio_btn: gtk::ToggleButton,
+    audio_syncing: Cell<bool>,
     /// Holds the address bar, which shows only while adding a machine, or
     /// while there are no tabs at all.
     add_revealer: gtk::Revealer,
@@ -173,6 +178,9 @@ struct Session {
     resize_scale: Cell<f64>,
     /// The output zoom last asked of the decoder; a new worker starts at 1.
     zoom: Cell<u32>,
+    /// The user's audio toggle for this session: starts on unless
+    /// `--no-audio`, and each worker is told the state on connect.
+    audio: Cell<bool>,
     /// The latest frame and its view, painted when the tab is shown.
     last_frame: RefCell<Option<(gdk::Texture, (u32, u32))>>,
     cursor: RefCell<Option<gdk::Cursor>>,
@@ -205,6 +213,7 @@ impl Session {
             resize_requested: Cell::new((0, 0)),
             resize_scale: Cell::new(0.0),
             zoom: Cell::new(1),
+            audio: Cell::new(true),
             last_frame: RefCell::new(None),
             cursor: RefCell::new(None),
             status: RefCell::new(String::new()),
@@ -314,6 +323,10 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         .icon_name("utilities-system-monitor-symbolic")
         .tooltip_text("Show stats")
         .build();
+    let audio_btn = gtk::ToggleButton::builder()
+        .icon_name(AUDIO_ON_ICON)
+        .tooltip_text("Remote audio")
+        .build();
     let tabs = gtk::Box::builder().spacing(6).build();
     let tabs_scroller = gtk::ScrolledWindow::builder()
         .child(&tabs)
@@ -326,6 +339,8 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     header.pack_start(&add_revealer);
     header.pack_end(&fullscreen_btn);
     header.pack_end(&stats_btn);
+    // Packed after stats, so it sits left of it: before the stats button.
+    header.pack_end(&audio_btn);
 
     let stats = gtk::Label::builder()
         .halign(gtk::Align::Start)
@@ -399,6 +414,8 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         capture_hinted: Cell::new(false),
         tabs,
         add_btn,
+        audio_btn,
+        audio_syncing: Cell::new(false),
         add_revealer,
         entry: entry.clone(),
         transfers,
@@ -420,6 +437,36 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     install_input_handlers(&ui, &video, &window, hotkey);
     install_resize_handler(&ui);
     install_address_bar(&ui, &connect_btn);
+
+    // The audio toggle follows the active session. A click flips that
+    // session's state, tells its worker (which tells the server and starts
+    // or stops local playback), and updates the icon.
+    {
+        let ui = ui.clone();
+        let btn = ui.audio_btn.clone();
+        btn.connect_toggled(move |btn| {
+            if ui.audio_syncing.get() {
+                return;
+            }
+            let Some(s) = active(&ui) else {
+                return;
+            };
+            s.audio.set(btn.is_active());
+            btn.set_icon_name(if btn.is_active() {
+                AUDIO_ON_ICON
+            } else {
+                AUDIO_OFF_ICON
+            });
+            let worker_tx = s.input_tx.borrow().clone();
+            if let Some(tx) = worker_tx {
+                let _ = tx.send(crate::clipboard::ToWorker::Audio(s.audio.get()));
+            }
+        });
+    }
+    if ui.cli.no_audio {
+        ui.audio_btn.set_visible(false);
+    }
+    refresh_audio_btn(&ui);
     refresh_tabs(&ui);
 
     // Fullscreen toggle.
@@ -512,6 +559,8 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
 const CONNECT_ICON: &str = "go-next-symbolic";
 const STOP_ICON: &str = "media-playback-stop-symbolic";
 const FORGET_ICON: &str = "window-close-symbolic";
+const AUDIO_ON_ICON: &str = "audio-volume-high-symbolic";
+const AUDIO_OFF_ICON: &str = "audio-volume-muted-symbolic";
 
 /// Wire the address bar: the + expands it, Enter connects to what was
 /// typed, and Escape, or leaving it empty, folds it back into the +.
@@ -821,6 +870,7 @@ fn select_tab(ui: &Rc<App>, name: &str) {
 /// Connect to `endpoint` in a new session and show it.
 fn open_session(ui: &Rc<App>, endpoint: Endpoint) {
     let s = Rc::new(Session::new(endpoint));
+    s.audio.set(!ui.cli.no_audio);
     ui.sessions.borrow_mut().push(s.clone());
     start_session(ui.clone(), s.clone());
     show_session(ui, &s);
@@ -849,6 +899,7 @@ fn show_session(ui: &Rc<App>, s: &Rc<Session>) {
     // shown.
     request_resize(ui);
     request_zoom(ui);
+    refresh_audio_btn(ui);
     refresh_tabs(ui);
 }
 
@@ -961,10 +1012,34 @@ fn set_stats(ui: &App, s: &Rc<Session>, text: &str) {
     }
 }
 
+/// Point the audio toggle at the active session: its icon and pressed
+/// state show that session's toggle, and nothing is clickable while no
+/// session is shown.
+fn refresh_audio_btn(ui: &Rc<App>) {
+    let session = active(ui);
+    let (on, sensitive) = match &session {
+        Some(s) => (s.audio.get(), !ui.cli.no_audio),
+        None => (!ui.cli.no_audio, false),
+    };
+    // Setting `active` would fire the toggled handler, which sends to the
+    // worker; block it with the flag while syncing the display.
+    ui.audio_syncing.set(true);
+    ui.audio_btn.set_active(on);
+    ui.audio_syncing.set(false);
+    ui.audio_btn
+        .set_icon_name(if on { AUDIO_ON_ICON } else { AUDIO_OFF_ICON });
+    ui.audio_btn.set_sensitive(sensitive);
+    ui.audio_btn.set_tooltip_text(Some(match &session {
+        Some(_) => "Remote audio",
+        None => "Remote audio (not connected)",
+    }));
+}
+
 /// Go back to a black screen with no stream geometry.
 fn show_disconnected(ui: &Rc<App>, s: &Rc<Session>) {
     if s.connected.replace(false) {
         refresh_tabs(ui);
+        refresh_audio_btn(ui);
     }
     s.last_frame.borrow_mut().take();
     s.stream_size.set((0, 0));
@@ -994,7 +1069,10 @@ fn start_session(ui: Rc<App>, s: Rc<Session>) {
 
     let endpoint = s.endpoint.clone();
     let video = gliff_sw::VideoMode::resolve(ui.cli.video.as_deref());
+    // The CLI flag is the capability (the feature is offered or not); the
+    // session's toggle is the state the worker starts the stream in.
     let audio = !ui.cli.no_audio;
+    let audio_on = s.audio.get();
     let keymap = ui.keymap.clone();
     std::thread::Builder::new()
         .name("gliff-net".into())
@@ -1003,6 +1081,7 @@ fn start_session(ui: Rc<App>, s: Rc<Session>) {
                 endpoint,
                 video,
                 audio,
+                audio_on,
                 frames: frame_tx,
                 status: status_tx,
                 input: input_rx,
@@ -1160,6 +1239,7 @@ fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u6
                     s.gave_up.set(false);
                     if !s.connected.replace(true) {
                         refresh_tabs(&ui);
+                        refresh_audio_btn(&ui);
                     }
                     set_status(&ui, &s, "");
                     // Visible before the first per-second stats arrive.

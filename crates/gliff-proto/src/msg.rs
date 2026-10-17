@@ -297,6 +297,15 @@ pub enum ClientMsg {
         #[n(0)]
         t: u64,
     },
+    /// Turn the server's audio stream on or off, in both directions of the
+    /// user's intent: off stops the server's capture, on restarts it. Sent
+    /// only while both ends listed [`FEATURE_AUDIO`], so an older server
+    /// never sees it.
+    #[n(17)]
+    AudioEnable {
+        #[n(0)]
+        enabled: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
@@ -625,6 +634,7 @@ mod tests {
             ClientMsg::Keymap {
                 keymap: "xkb".into(),
             },
+            ClientMsg::AudioEnable { enabled: true },
         ];
         for m in msgs {
             let bytes = minicbor::to_vec(&m).unwrap();
@@ -739,6 +749,7 @@ mod tests {
                 "820682182a1903e8",
             ),
             (ClientMsg::RequestKeyframe, "820780"),
+            (ClientMsg::AudioEnable { enabled: false }, "821181f4"),
         ];
         for (msg, bytes) in client {
             assert_eq!(hex(&minicbor::to_vec(&msg).unwrap()), bytes, "{msg:?}");
